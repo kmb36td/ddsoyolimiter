@@ -2,6 +2,7 @@ Parts Required:
 1 esp32 30pin
 2 Taxnele DDS669 Bidirectional meter
 2 TTL to RS485
+1 SSD1306 128x64 oled display
 
 Connection:
     SOYOSOURCE

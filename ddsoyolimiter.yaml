@@ -1,0 +1,607 @@
+#################################################################################
+# PROJECT: Soyosource Multi-Inverter Zero-Export Limiter (Precision Edition)
+#################################################################################
+
+substitutions:
+  name: ddsoyo-limiter
+  device_description: "Dual DDS669 + Soyosource Broadcast Limiter"
+  max_num_inverter: "4.0" 
+
+esphome:
+  name: ${name}
+  friendly_name: ${name}
+  on_boot:
+    priority: -10
+    then:
+      - lambda: 'id(shadow_power_demand) = 0;'
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    advanced:
+      minimum_chip_revision: '3.1'
+
+wifi:
+  id: wifi_id
+  networks:
+    - ssid: !secret wifi_ssid3
+      password: !secret wifi_password
+  
+ota:
+  - platform: esphome
+    on_begin:
+      then:
+        # 1. Turn off the master switch immediately
+        - switch.turn_off: inverter_switch
+        
+        # 2. Force the variables to 0. 
+        # This guarantees that the NEXT natural run of your loop formats a 0W packet.
+        - lambda: |-
+            id(shadow_power_demand) = 0;
+            id(total_demand).publish_state(0);
+            
+        - logger.log:
+            level: WARN
+            format: "OTA initiated. Variables set to 0W. Waiting for scheduled loop delivery..."
+            
+        # 3. Wait long enough to ensure the natural background script loop executes, 
+        # reads the 0W state, and sends the standard 500ms rhythmic packet.
+        - delay: 2000ms
+
+api:
+
+logger:
+  baud_rate: 0 
+  level: INFO
+
+globals:
+  - id: shadow_power_demand
+    type: float
+    restore_value: no
+    initial_value: '0'
+
+  - id: bRestart
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: bsetParallel
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: bshowImportExport
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: inv_count
+    type: float
+    restore_value: no 
+    initial_value: '1'
+
+  - id: system_state
+    type: int
+    restore_value: no
+    initial_value: '0'   # 0 = normal, 1 = warning, 2 = error
+  
+uart:
+  - id: uart_meter
+    tx_pin: GPIO26 
+    rx_pin: GPIO27 
+    baud_rate: 9600
+    stop_bits: 1
+    parity: NONE
+
+  - id: uart_inverter
+    tx_pin: GPIO33 
+    rx_pin: GPIO32 
+    baud_rate: 4800
+    stop_bits: 1
+    parity: NONE
+
+modbus:
+  - id: modbus_bus_meters
+    uart_id: uart_meter
+
+modbus_controller:
+  - id: dds669_load
+    address: 1
+    modbus_id: modbus_bus_meters
+    update_interval: never 
+    max_cmd_retries: 4
+    setup_priority: -10
+    allow_duplicate_commands: false
+
+  - id: dds669_solar
+    address: 2
+    modbus_id: modbus_bus_meters
+    update_interval: never 
+    max_cmd_retries: 4
+    setup_priority: -10
+    allow_duplicate_commands: false
+
+number:
+  - platform: template
+    name: "External Solar"
+    id: extsolar
+    optimistic: true
+    initial_value: 0.0
+    restore_value: false
+    min_value: 0
+    max_value: 3000
+    step: 0.1
+
+  - platform: template
+    name: "Limit Bias"
+    id: limit_bias
+    icon: "mdi:arrow-expand-vertical"
+    optimistic: true
+    min_value: 0
+    max_value: 1000
+    mode: box
+    step: 10
+    initial_value: 100  
+    unit_of_measurement: "W"
+
+  - platform: template
+    name: "Number of Parallel Inverters"
+    id: inverter_count
+    min_value: 1
+    max_value: ${max_num_inverter}
+    step: 1
+    initial_value: 1 
+    mode: box
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    name: "Max Power Per Inverter"
+    id: individual_max_limit
+    unit_of_measurement: "W"
+    min_value: 0
+    max_value: 1600
+    step: 50
+    initial_value: 1200
+    mode: box
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    name: "Zero-Export Target"
+    id: control_target
+    unit_of_measurement: "W"
+    min_value: -500
+    max_value: 500
+    step: 1
+    initial_value: 0
+    mode: box
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    name: "Zero-Export Deadband"
+    id: control_deadband
+    unit_of_measurement: "W"
+    min_value: 0
+    max_value: 50
+    step: 1
+    initial_value: 0
+    mode: box
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    name: "Proportional Gain (kP)"
+    id: control_kp
+    min_value: 0.1
+    max_value: 1.0
+    step: 0.05
+    initial_value: 0.6
+    mode: box
+    restore_value: true
+    optimistic: true
+            
+sensor:
+  # --- METER 1: LOAD (HOUSE) ---
+  - platform: modbus_controller
+    modbus_controller_id: dds669_load
+    name: "Load Power"
+    id: load_power
+    register_type: read
+    address: 0x08
+    force_new_range: true
+    value_type: S_WORD
+    unit_of_measurement: "W"
+    filters:
+      - throttle: 1.0s
+
+  # --- METER 2: SOLAR ---
+  - platform: modbus_controller
+    modbus_controller_id: dds669_solar
+    name: "Solar Power"
+    id: solar_power
+    register_type: read
+    address: 0x08
+    force_new_range: true
+    value_type: S_WORD
+    unit_of_measurement: "W"
+    filters:
+      - throttle: 1.0s
+
+  # --- CALCULATION LOGIC ---
+  - platform: template
+    name: "Soyosource Per-Unit Demand"
+    id: soyosource_demand
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    update_interval: 500ms
+    filters:
+      - throttle: 1.0s
+    lambda: |-
+      ESP_LOGD("soyosource_debug", "Lambda execution started...");
+      int num_inv = (int)id(inverter_count).state;
+      if (num_inv < 1) num_inv = 1;
+
+      // INVERTED LOGIC: If switch is OFF, force 0 demand
+      if (!id(inverter_switch).state) {
+          id(shadow_power_demand) = 0;
+          id(system_state) = 1;           // warning state
+          id(total_demand).publish_state( id(shadow_power_demand) );
+          return 0.0;
+      }
+
+      if (id(bRestart)) {
+          id(shadow_power_demand) = 0;
+          id(total_demand).publish_state( id(shadow_power_demand) );
+          return 0.0;
+      }
+
+      if (!id(load_power).has_state() || !id(solar_power).has_state()) {
+          id(shadow_power_demand) = 0;
+          id(total_demand).publish_state( 0.0 );
+          id(system_state) = 2; // error state
+          ESP_LOGI("soyosource_debug", "Solar or Load meter State Unknown: %.0f W", id(shadow_power_demand));
+          return 0.0; 
+      }
+
+      id(system_state) = 0;
+      float current_load = id(load_power).state;
+      float current_solar = id(solar_power).state;
+      float net_grid = current_load - current_solar;
+
+      ESP_LOGD("soyosource_debug", "current_load: %.0f W", current_load);
+      ESP_LOGD("soyosource_debug", "current_solar: %.0f W", current_solar);
+      ESP_LOGD("soyosource_debug", "net_grid: %.0f W", net_grid);
+
+      float target = id(control_target).state;
+      float kI = id(control_kp).state;
+      float error = net_grid - target;
+      
+      if (std::abs(error) > id(control_deadband).state) {
+          id(shadow_power_demand) += (error * kI);
+      }
+
+      ESP_LOGD("soyosource_debug", "demand deadband: %.0f W", id(shadow_power_demand));
+
+      float total_limit = num_inv * id(individual_max_limit).state;
+      float dynamic_limit = (current_load - id(extsolar).state) > 0.0 ? (current_load - id(extsolar).state) : 0.0;
+
+      if(total_limit > dynamic_limit){
+          total_limit = dynamic_limit + id(limit_bias).state;
+      }
+
+      if (id(shadow_power_demand) < 0) {
+          id(shadow_power_demand) = 0;
+      } else if (id(shadow_power_demand) > total_limit) {
+          id(shadow_power_demand) = total_limit;
+      }
+
+      ESP_LOGD("soyosource_debug", "Calculated Demand: %.0f W", id(shadow_power_demand));
+      id(total_demand).publish_state( id(shadow_power_demand) );
+
+      float per_unit_demand = id(shadow_power_demand) / num_inv;
+      return per_unit_demand;
+
+  - platform: template
+    name: "Total Demand"
+    id: total_demand
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    update_interval: never # FIX: Remove lambda conflict and handle dynamically via manual publish_state
+    filters:
+      - throttle: 1.0s
+      
+  - platform: template
+    name: "Import Power"
+    id: importpower
+    unit_of_measurement: "W"
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle: 1.0s
+    lambda: |-
+      if (!id(load_power).has_state() || !id(solar_power).has_state()) return 0.0;
+      float importpower = id(load_power).state - id(solar_power).state;
+      return (importpower < 0.0) ? 0.0 : importpower;
+  
+  - platform: template
+    name: "Export Power"
+    id: exportpower
+    unit_of_measurement: "W"
+    accuracy_decimals: 1
+    update_interval: never
+    filters:
+      - throttle: 1.0s
+    lambda: |-
+      if (!id(load_power).has_state() || !id(solar_power).has_state()) return 0.0;
+      float importpower = id(load_power).state - id(solar_power).state;
+      return (importpower < 0.0) ? (importpower * -1.0) : 0.0;
+
+# --- GLOBAL CONTROLS ---
+switch:
+  - platform: template
+    name: "Global Inverter Switch"
+    id: inverter_switch
+    icon: "mdi:power"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON # Default to ON so system starts working normally on boot
+    on_turn_off:
+      then:
+        - lambda: "id(shadow_power_demand) = 0;"
+        - logger.log:
+            level: WARN
+            format: "INVERTER SWITCH TURNED OFF - POWER OUTPUT DISENGAGED"
+    on_turn_on:
+      then:
+        - logger.log: "Inverter Switch Engaged - Resuming Control Loop"
+
+script:
+  - id: safe_restart_sequence
+    mode: restart
+    then:
+      - logger.log: "Starting safe restart sequence..."
+      - lambda: |-
+          id(bRestart) = true;
+          id(shadow_power_demand) = 0;
+      - delay: 5s
+      - logger.log: "Rebooting now."
+      - lambda: esp_restart();
+  
+  - id: buzzer_warning
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(system_state) == 1;'
+          then:
+            - output.turn_on: buzzer
+            - delay: 500ms
+            - output.turn_off: buzzer
+            - delay: 1500ms
+
+  - id: buzzer_alert
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(system_state) == 2;'
+          then:
+            - output.turn_on: buzzer
+            - delay: 100ms
+            - output.turn_off: buzzer
+            - delay: 100ms
+            - output.turn_on: buzzer
+            - delay: 100ms
+            - output.turn_off: buzzer
+            - delay: 100ms
+            - output.turn_on: buzzer
+            - delay: 100ms
+            - output.turn_off: buzzer
+            - delay: 1500ms
+
+button:
+  - platform: template
+    name: "SafeRestart"
+    id: safe_restart_button
+    on_press:
+      - script.execute: safe_restart_sequence
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO4
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Config Button"
+    on_click:
+      - min_length: 50ms
+        max_length: 500ms
+        then:
+          - lambda: |-
+              if( id(bsetParallel) == false) {
+                id(bshowImportExport) = !id(bshowImportExport);
+              } else {
+                id(inv_count) = id(inv_count) + 1;
+                if( id(inv_count) > ${max_num_inverter} ){
+                  id(inv_count) = 1;
+                }
+              }
+              id(oled).update();
+      - min_length: 3000ms
+        max_length: 5000ms
+        then:
+          - lambda: |-
+              if(id(bsetParallel) == true){
+                id(bsetParallel) = false;
+                id(inverter_count).publish_state(id(inv_count));
+              } else {
+                id(bsetParallel) = true;
+                id(inv_count) = (int)id(inverter_count).state;
+              }
+              id(oled).update();
+              
+  - platform: gpio
+    pin:
+      number: GPIO17
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Global Inverter Toggle Button"
+    on_press:
+      # INVERTED LOGIC: Physical toggle button behavior rewritten
+      - lambda: |-
+          if (id(inverter_switch).state){
+            id(inverter_switch).turn_off();
+            id(system_state) = 1;
+            id(buzzer_warning).execute();
+          } else {
+            id(system_state) = 0;
+            id(inverter_switch).turn_on();
+          }
+          
+output:
+  - platform: gpio
+    pin: GPIO2
+    id: builtin_led
+
+  - platform: gpio
+    pin: GPIO25
+    id: buzzer
+
+interval:
+  - interval: 600ms
+    then:
+      - lambda: |-
+          // HARDWARE-LEVEL RATE LIMITER SAFETY
+          static uint32_t last_tx_time = 0;
+          uint32_t now = millis();
+          
+          // STRICT PROTECTIVE RULE: If less than 450ms has elapsed since the exact millisecond 
+          // of the last successful transmission, abort immediately to protect the inverter buffer.
+          if (last_tx_time != 0 && (now - last_tx_time < 450)) {
+            ESP_LOGW("soyosource_safety", "Transmission blocked! Prevented frame from firing too fast.");
+            return; 
+          }
+          
+          // Safe to send! Update the timestamp tracker to the current millisecond
+          last_tx_time = now;
+
+          // 1. TRANSMIT TO INVERTER (Fires safely at the 0ms mark)
+          int wattage = (int)id(soyosource_demand).state; 
+          uint8_t frame[8];                               
+          frame[0] = 0x24;                                 
+          frame[1] = 0x56;                                 
+          frame[2] = 0x00;                                 
+          frame[3] = 0x21;                                 
+          frame[4] = (uint8_t)(wattage >> 8);              
+          frame[5] = (uint8_t)(wattage & 0xFF);            
+          frame[6] = 0x80;                                 
+          frame[7] = (uint8_t)(264 - frame[4] - frame[5]); 
+
+          id(uart_inverter).write_array(frame, 8);
+          
+      # 2. SEPARATION DELAY
+      # Gives the inverter board 30ms to process the frame before we touch the RS485 bus
+      - delay: 30ms 
+      
+      - lambda: |-
+          // 3. POLL METER 1 (LOAD)
+          id(dds669_load).update();
+          
+      # 4. MODBUS BUS SETTLING DELAY
+      # Gives Meter 1 time to reply and clears the shared RS485 line completely
+      - delay: 300ms 
+      
+      - lambda: |-
+          // 5. POLL METER 2 (SOLAR) + UPDATE POWER TEMPLATES
+          id(dds669_solar).update();
+          id(importpower).update();
+          id(exportpower).update();
+          
+      # 6. FINAL BUS SETTLING DELAY
+      - delay: 270ms
+      
+      - lambda: |-
+          // 7. PROCESS ZERO-EXPORT CALCULATIONS
+          // This updates "soyosource_demand" in memory, ready for the next 0ms step
+          id(soyosource_demand).update();
+          
+  - interval: 1s
+    then:
+      - lambda: |-
+          static bool state = false;
+          state = !state;
+          if (state) {
+            id(builtin_led).turn_on();
+          } else {
+            id(builtin_led).turn_off();
+          }
+
+  - interval: 300s
+    then:
+      - if:
+          condition:
+            wifi.connected:
+          then:
+            - logger.log: "Wi-Fi OK"
+          else:
+            - logger.log: "Wi-Fi disconnected"
+            - wifi.disable: {}
+            - delay: 2s
+            - wifi.enable: {}
+
+  - interval: 60s
+    then:
+      - script.execute: buzzer_warning
+
+  - interval: 3000ms
+    then:
+      - script.execute: buzzer_alert
+
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  scan: true
+
+font:
+  - file: "gfonts://Roboto"
+    id: oled_font
+    size: 12
+
+  - file: "gfonts://Roboto"
+    id: oled_fontB
+    size: 16
+
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    id: oled
+    address: 0x3C
+    lambda: |-
+      if(id(bsetParallel) == true )
+      {
+        it.printf(0, 21,  id(oled_fontB), "inverters: %.0f", id(inv_count));
+        return;
+      }
+
+      if(id(bshowImportExport))
+      {
+        float importpower = id(load_power).state - id(solar_power).state;
+        float exportpower = 0.0;
+        if( importpower < 0.0 )
+        {
+          exportpower = importpower * (-1.0);
+          importpower = 0.0;
+        }
+        it.printf(0, 0,  id(oled_fontB), "inverters: %.0f", id(inverter_count).state);
+        it.printf(0, 21,  id(oled_fontB), "Import: %.0f W", importpower);
+        it.printf(0, 42,  id(oled_fontB), "Export: %.0f W", exportpower);
+      }
+      else
+      {
+        it.printf(0, 0,  id(oled_font), "UDemand: %.0f W", id(soyosource_demand).state);
+        it.printf(0, 16, id(oled_font), "TDemand: %.0f W", id(total_demand).state);
+        it.printf(21, 32, id(oled_font), " Solar: %.0f W", id(solar_power).state);
+        it.printf(18, 48, id(oled_font), "  Load: %.0f W", id(load_power).state);
+      }

@@ -2,7 +2,7 @@ Parts Required:
 1 esp32 30pin
 2 Taxnele DDS669 Bidirectional meter
 2 TTL to RS485
-1 SSD1306 128x64 oled display
+1 i2c SSD1306 128x64 oled display
 2 momentary push buttons
 
 Connection:
@@ -21,6 +21,10 @@ UART pins of ESP32 -> TTL to RS485 module then RS485's to Meter and Inverter :
     tx_pin: GPIO33 
     rx_pin: GPIO32
     
+i2c pins for the oled display
+  sda: GPIO21
+  scl: GPIO22
+  
 RS485 Connections:
 TTL to RS485 module(1) -> DDS669(1)Loads -> DDS669(2)Solar
 TTL to RS485 module(2) -> Soyosource Inverter

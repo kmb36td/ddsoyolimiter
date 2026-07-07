@@ -18,3 +18,4 @@ UART pins of ESP32 -> TTL to RS485 module then RS485's to Meter and Inverter :
   - id: uart_inverter
     tx_pin: GPIO33 
     rx_pin: GPIO32
+

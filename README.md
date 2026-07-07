@@ -3,6 +3,7 @@ Parts Required:
 2 Taxnele DDS669 Bidirectional meter
 2 TTL to RS485
 1 SSD1306 128x64 oled display
+2 momentary push buttons
 
 Connection:
     SOYOSOURCE
